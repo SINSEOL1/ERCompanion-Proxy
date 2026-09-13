@@ -125,11 +125,13 @@ function normalizeRows(rows) {
   const result = [];
   const seen = new Set();
   for (const raw of rows.slice(0, 24)) {
+    const rowId = toInt(raw?.rowId);
     const localKey = toInt(raw?.localKey);
     const play = toInt(raw?.play);
-    if (localKey <= 0 || play <= 0 || seen.has(localKey)) continue;
-    seen.add(localKey);
+    if (rowId <= 0 || play <= 0 || seen.has(rowId)) continue;
+    seen.add(rowId);
     result.push({
+      rowId,
       localKey,
       play,
       win: Math.max(0, toInt(raw?.win)),
@@ -187,7 +189,7 @@ async function pacedOfficialFetch(urlPath, apiKey) {
         headers: {
           'x-api-key': apiKey,
           'accept': 'application/json',
-          'user-agent': 'ERCompanion-Identity-Proxy/2.6.0-hf2'
+          'user-agent': 'ERCompanion-Identity-Proxy/2.6.0-hf3'
         },
         signal: controller.signal
       });
@@ -320,6 +322,7 @@ function resolveRows(rows, candidates) {
     if (!best || best.confidence < 0.50) break;
     const row = rows[best.rowIndex];
     out.push({
+      rowId: row.rowId,
       localKey: row.localKey,
       characterCode: best.candidate.code,
       name: best.candidate.name || characterName(best.candidate.code),
@@ -369,7 +372,7 @@ function characterName(code) {
 }
 
 function makeCacheKey(nickname, mode, seasonKey, rows) {
-  return `${nickname.toLowerCase()}|${mode}|${seasonKey}|` + rows.map(r => `${r.localKey}:${r.play}:${r.win}:${Math.round(r.playerKill)}:${Math.round(r.damageToPlayer)}`).join(';');
+  return `${nickname.toLowerCase()}|${mode}|${seasonKey}|` + rows.map(r => `${r.rowId}:${r.localKey}:${r.play}:${r.win}:${Math.round(r.playerKill)}:${Math.round(r.damageToPlayer)}`).join(';');
 }
 
 function putCache(key, value) {

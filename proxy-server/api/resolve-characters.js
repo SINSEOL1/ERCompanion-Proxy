@@ -89,7 +89,14 @@ module.exports = async function handler(req, res) {
       if (!seasonGames.length) seasonGames = modeGamesAll;
       const gameCandidates = aggregateGames(seasonGames);
       const candidates = mergeCandidates(statsCandidates, gameCandidates);
-      source = { detectedSeasonId, candidates, expires: Date.now() + SOURCE_CACHE_TTL_MS };
+      source = {
+        detectedSeasonId,
+        candidates,
+        allGamesCount: allGames.length,
+        modeGamesCount: modeGamesAll.length,
+        seasonGamesCount: seasonGames.length,
+        expires: Date.now() + SOURCE_CACHE_TTL_MS
+      };
       sourceCache.set(sourceKey, source);
       trimTimedCache(sourceCache, 800);
     }
@@ -101,6 +108,9 @@ module.exports = async function handler(req, res) {
     const value = {
       nickname: user?.nickname || nickname,
       officialSeasonId: detectedSeasonId || null,
+      candidateCount: candidates.length,
+      officialModeGames: source.modeGamesCount || 0,
+      officialSeasonGames: source.seasonGamesCount || 0,
       mappings
     };
     putCache(cacheKey, value);
@@ -189,7 +199,7 @@ async function pacedOfficialFetch(urlPath, apiKey) {
         headers: {
           'x-api-key': apiKey,
           'accept': 'application/json',
-          'user-agent': 'ERCompanion-Identity-Proxy/2.6.0-hf3'
+          'user-agent': 'ERCompanion-Identity-Proxy/2.6.0-hf4'
         },
         signal: controller.signal
       });
@@ -305,6 +315,8 @@ function resolveRows(rows, candidates) {
   const unresolvedRows = new Set(rows.map((_, i) => i));
   const unusedCodes = new Set(candidates.map(c => c.code));
   const out = [];
+  const rowTotalGames = rows.reduce((sum, r) => sum + Math.max(0, r.play), 0);
+  const candidateRecentTotal = candidates.reduce((sum, c) => sum + Math.max(0, c.recentGames), 0);
 
   while (unresolvedRows.size && unusedCodes.size) {
     let best = null;
@@ -312,8 +324,8 @@ function resolveRows(rows, candidates) {
       const row = rows[rowIndex];
       for (const c of candidates) {
         if (!unusedCodes.has(c.code)) continue;
-        const scored = score(row, c);
-        if (!best || scored.cost < best.cost || (scored.cost === best.cost && scored.confidence > best.confidence)) {
+        const scored = score(row, c, rowTotalGames, candidateRecentTotal);
+        if (!best || scored.cost < best.cost || (Math.abs(scored.cost - best.cost) < 0.0001 && scored.confidence > best.confidence)) {
           best = { rowIndex, candidate: c, ...scored };
         }
       }
@@ -335,15 +347,15 @@ function resolveRows(rows, candidates) {
   return out;
 }
 
-function score(row, c) {
+function score(row, c, rowTotalGames, candidateRecentTotal) {
   const options = [];
-  if (c.statsGames > 0) options.push(scoreAgainst(row, c, c.statsGames, c.statsWins, false));
-  if (c.recentGames > 0) options.push(scoreAgainst(row, c, c.recentGames, c.recentWins, true));
+  if (c.statsGames > 0) options.push(scoreAgainst(row, c, c.statsGames, c.statsWins, false, rowTotalGames, candidateRecentTotal));
+  if (c.recentGames > 0) options.push(scoreAgainst(row, c, c.recentGames, c.recentWins, true, rowTotalGames, candidateRecentTotal));
   if (!options.length) return { cost: 999999, confidence: 0 };
   return options.sort((a, b) => (a.cost - b.cost) || (b.confidence - a.confidence))[0];
 }
 
-function scoreAgainst(row, c, games, wins, hasFingerprint) {
+function scoreAgainst(row, c, games, wins, hasFingerprint, rowTotalGames, candidateRecentTotal) {
   const playDiff = Math.abs(row.play - games);
   const winDiff = Math.abs(row.win - wins);
   let cost = playDiff * 45 + winDiff * 90;
@@ -354,14 +366,52 @@ function scoreAgainst(row, c, games, wins, hasFingerprint) {
   else if (playDiff <= 1 && winDiff <= 1) confidence = 0.60;
   else if (playDiff <= Math.max(2, Math.ceil(row.play * 0.08)) && winDiff <= Math.max(1, Math.ceil(row.win * 0.15))) confidence = 0.51;
 
-  if (hasFingerprint && c.recentGames === row.play) {
-    const killDiff = Math.abs(row.playerKill - c.kills);
-    const damageDiff = Math.abs(row.damageToPlayer - c.damage);
-    const damageTolerance = Math.max(500, row.damageToPlayer * 0.015);
-    cost += killDiff * 7 + Math.min(120, damageDiff / Math.max(250, damageTolerance / 6));
-    if (killDiff === 0) confidence += 0.06;
-    if (damageDiff <= damageTolerance) confidence += 0.09;
-    if (killDiff === 0 && damageDiff <= damageTolerance) confidence = Math.max(confidence, 0.97);
+  if (hasFingerprint && games > 0 && row.play > 0) {
+    const rowWinRate = row.win / row.play;
+    const candidateWinRate = wins / games;
+    const rowAvgKills = row.playerKill / row.play;
+    const candidateAvgKills = c.kills / games;
+    const rowAvgDamage = row.damageToPlayer / row.play;
+    const candidateAvgDamage = c.damage / games;
+
+    const winRateDiff = Math.abs(rowWinRate - candidateWinRate);
+    const killAvgDiff = Math.abs(rowAvgKills - candidateAvgKills);
+    const damageAvgDiff = Math.abs(rowAvgDamage - candidateAvgDamage);
+    const damageRelDiff = damageAvgDiff / Math.max(1500, rowAvgDamage, candidateAvgDamage);
+
+    const rowShare = rowTotalGames > 0 ? row.play / rowTotalGames : 0;
+    const candidateShare = candidateRecentTotal > 0 ? games / candidateRecentTotal : 0;
+    const shareDiff = Math.abs(rowShare - candidateShare);
+
+    // Per-game fingerprinting remains useful when DAK and the official API cover slightly
+    // different windows (especially Cobalt, where userStats v2 is not available).
+    cost = Math.min(cost,
+      shareDiff * 900 +
+      winRateDiff * 420 +
+      killAvgDiff * 55 +
+      damageRelDiff * 260);
+
+    if (shareDiff <= 0.020 && winRateDiff <= 0.055 && killAvgDiff <= 0.35 && damageRelDiff <= 0.10)
+      confidence = Math.max(confidence, 0.90);
+    else if (shareDiff <= 0.040 && winRateDiff <= 0.09 && killAvgDiff <= 0.55 && damageRelDiff <= 0.16)
+      confidence = Math.max(confidence, 0.78);
+    else if (shareDiff <= 0.070 && winRateDiff <= 0.14 && killAvgDiff <= 0.85 && damageRelDiff <= 0.24)
+      confidence = Math.max(confidence, 0.62);
+
+    // Very distinctive per-game combat fingerprints can safely rescue a row even when the
+    // match-count windows differ substantially.
+    if (killAvgDiff <= 0.18 && damageRelDiff <= 0.065 && winRateDiff <= 0.08)
+      confidence = Math.max(confidence, 0.82);
+
+    if (games === row.play) {
+      const killDiff = Math.abs(row.playerKill - c.kills);
+      const damageDiff = Math.abs(row.damageToPlayer - c.damage);
+      const damageTolerance = Math.max(500, row.damageToPlayer * 0.015);
+      cost += killDiff * 7 + Math.min(120, damageDiff / Math.max(250, damageTolerance / 6));
+      if (killDiff === 0) confidence += 0.06;
+      if (damageDiff <= damageTolerance) confidence += 0.09;
+      if (killDiff === 0 && damageDiff <= damageTolerance) confidence = Math.max(confidence, 0.97);
+    }
   }
 
   return { cost, confidence: Math.min(0.99, confidence) };

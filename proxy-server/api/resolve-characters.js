@@ -10,6 +10,22 @@ globalThis.__ERCOMPANION_IDENTITY_CACHE__ = cache;
 const rateBuckets = globalThis.__ERCOMPANION_RATE_BUCKETS__ || new Map();
 globalThis.__ERCOMPANION_RATE_BUCKETS__ = rateBuckets;
 
+// Official Open API calls from several teammates can arrive at the same time.
+// Serialize/pacing them per warm Vercel instance instead of bursting 6-9 requests at once.
+const officialPacer = globalThis.__ERCOMPANION_OFFICIAL_PACER__ || { tail: Promise.resolve(), nextAt: 0 };
+globalThis.__ERCOMPANION_OFFICIAL_PACER__ = officialPacer;
+const OFFICIAL_MIN_INTERVAL_MS = 1150;
+
+// Avoid repeating nickname -> UID lookups when the DAK fingerprint changes slightly.
+const uidCache = globalThis.__ERCOMPANION_UID_CACHE__ || new Map();
+globalThis.__ERCOMPANION_UID_CACHE__ = uidCache;
+const UID_CACHE_TTL_MS = 10 * 60_000;
+
+// Cache the official candidate set independently from the DAK row fingerprint.
+const sourceCache = globalThis.__ERCOMPANION_SOURCE_CACHE__ || new Map();
+globalThis.__ERCOMPANION_SOURCE_CACHE__ = sourceCache;
+const SOURCE_CACHE_TTL_MS = 60_000;
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
@@ -38,42 +54,48 @@ module.exports = async function handler(req, res) {
       return res.status(200).json(cached.value);
     }
 
-    const userJson = await officialGet(`/v1/user/nickname?query=${encodeURIComponent(nickname)}`, apiKey);
-    const user = userJson.user || userJson.data?.user || userJson.data;
-    const uid = user?.uid || user?.userId;
+    const user = await getOfficialUser(nickname, apiKey);
+    const uid = user?.uid || user?.userId || user?.userNum;
     if (!uid) return res.status(404).json({ error: 'player_not_found', mappings: [] });
 
-    // Recent games serve two purposes: they reveal the official characterNum and provide
-    // kill/damage fingerprints for rows whose play/win counts collide.
-    const gamesJson = await officialGet(`/v1/user/games/uid/${encodeURIComponent(uid)}`, apiKey);
-    const allGames = Array.isArray(gamesJson.userGames) ? gamesJson.userGames
-      : Array.isArray(gamesJson.data?.userGames) ? gamesJson.data.userGames
-      : [];
+    const sourceKey = `${String(uid)}|${mode}|${seasonKey}`;
+    let source = sourceCache.get(sourceKey);
+    if (!source || source.expires <= Date.now()) {
+      // Recent games reveal the official characterNum and also let us discover the live
+      // official season id.  Calls are paced globally so three teammates don't burst
+      // the Open API at the same instant.
+      const gamesJson = await officialGet(`/v1/user/games/uid/${encodeURIComponent(uid)}`, apiKey);
+      const allGames = Array.isArray(gamesJson.userGames) ? gamesJson.userGames
+        : Array.isArray(gamesJson.data?.userGames) ? gamesJson.data.userGames
+        : [];
 
-    const modeGamesAll = allGames.filter(g => Number(g.matchingMode) === mode);
-    const detectedSeasonId = detectSeasonId(modeGamesAll, seasonKey, mode);
-    let seasonGames = filterSeasonGames(modeGamesAll, detectedSeasonId, mode);
+      const modeGamesAll = allGames.filter(g => Number(g.matchingMode) === mode);
+      const detectedSeasonId = detectSeasonId(modeGamesAll, seasonKey, mode);
+      let seasonGames = filterSeasonGames(modeGamesAll, detectedSeasonId, mode);
 
-    let statsCandidates = [];
-    if (mode === 2 || mode === 3) {
-      // Official API requires 0 for Normal. Ranked uses the detected current official season.
-      const statsSeasonId = mode === 2 ? 0 : detectedSeasonId;
-      if (mode === 2 || statsSeasonId > 0) {
-        try {
-          const statsJson = await officialGet(`/v2/user/stats/uid/${encodeURIComponent(uid)}/${statsSeasonId}/${mode}`, apiKey);
-          statsCandidates = parseStatsCandidates(statsJson);
-        } catch (err) {
-          // Identity can still be resolved from recent games; don't fail the whole request.
-          if (!isExpectedMissing(err)) throw err;
+      let statsCandidates = [];
+      if (mode === 2 || mode === 3) {
+        const statsSeasonId = mode === 2 ? 0 : detectedSeasonId;
+        if (mode === 2 || statsSeasonId > 0) {
+          try {
+            const statsJson = await officialGet(`/v2/user/stats/uid/${encodeURIComponent(uid)}/${statsSeasonId}/${mode}`, apiKey);
+            statsCandidates = parseStatsCandidates(statsJson);
+          } catch (err) {
+            if (!isExpectedMissing(err)) throw err;
+          }
         }
       }
+
+      if (!seasonGames.length) seasonGames = modeGamesAll;
+      const gameCandidates = aggregateGames(seasonGames);
+      const candidates = mergeCandidates(statsCandidates, gameCandidates);
+      source = { detectedSeasonId, candidates, expires: Date.now() + SOURCE_CACHE_TTL_MS };
+      sourceCache.set(sourceKey, source);
+      trimTimedCache(sourceCache, 800);
     }
 
-    // If season filtering found nothing (common around season transitions), keep the mode-only
-    // recent games as a fallback fingerprint source.
-    if (!seasonGames.length) seasonGames = modeGamesAll;
-    const gameCandidates = aggregateGames(seasonGames);
-    const candidates = mergeCandidates(statsCandidates, gameCandidates);
+    const detectedSeasonId = source.detectedSeasonId;
+    const candidates = source.candidates;
     const mappings = resolveRows(rows, candidates);
 
     const value = {
@@ -119,26 +141,91 @@ function normalizeRows(rows) {
 }
 
 async function officialGet(urlPath, apiKey) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 7000);
-  try {
-    const response = await fetch(OFFICIAL_BASE + urlPath, {
-      headers: {
-        'x-api-key': apiKey,
-        'accept': 'application/json',
-        'user-agent': 'ERCompanion-Identity-Proxy/2.6.0'
-      },
-      signal: controller.signal
-    });
-    if (!response.ok) {
-      const error = new Error(`official_http_${response.status}`);
-      error.status = response.status;
-      throw error;
+  let lastStatus = 500;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await pacedOfficialFetch(urlPath, apiKey);
+    lastStatus = response.status;
+
+    if (response.ok) return await response.json();
+
+    // A short burst of teammate lookups can trip the official 429 limit. Respect
+    // Retry-After when present, otherwise back off briefly and try again.
+    if (response.status === 429 && attempt < 2) {
+      const retryAfter = Number(response.headers.get('retry-after'));
+      const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(8000, retryAfter * 1000)
+        : 1250 + (attempt * 1250);
+      await sleep(waitMs);
+      continue;
     }
-    return await response.json();
-  } finally {
-    clearTimeout(timer);
+
+    const error = new Error(`official_http_${response.status}`);
+    error.status = response.status;
+    throw error;
   }
+
+  const error = new Error(`official_http_${lastStatus}`);
+  error.status = lastStatus;
+  throw error;
+}
+
+async function pacedOfficialFetch(urlPath, apiKey) {
+  let release;
+  const myTurn = new Promise(resolve => { release = resolve; });
+  const previous = officialPacer.tail;
+  officialPacer.tail = previous.catch(() => {}).then(() => myTurn);
+  await previous.catch(() => {});
+
+  try {
+    const waitMs = Math.max(0, officialPacer.nextAt - Date.now());
+    if (waitMs > 0) await sleep(waitMs);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 7000);
+    try {
+      const response = await fetch(OFFICIAL_BASE + urlPath, {
+        headers: {
+          'x-api-key': apiKey,
+          'accept': 'application/json',
+          'user-agent': 'ERCompanion-Identity-Proxy/2.6.0-hf2'
+        },
+        signal: controller.signal
+      });
+      officialPacer.nextAt = Date.now() + OFFICIAL_MIN_INTERVAL_MS;
+      return response;
+    } finally {
+      clearTimeout(timer);
+    }
+  } finally {
+    release();
+  }
+}
+
+async function getOfficialUser(nickname, apiKey) {
+  const key = nickname.toLowerCase();
+  const cached = uidCache.get(key);
+  if (cached && cached.expires > Date.now()) return cached.user;
+
+  const userJson = await officialGet(`/v1/user/nickname?query=${encodeURIComponent(nickname)}`, apiKey);
+  const user = userJson.user || userJson.data?.user || userJson.data;
+  if (user) {
+    uidCache.set(key, { user, expires: Date.now() + UID_CACHE_TTL_MS });
+    trimTimedCache(uidCache, 1000);
+  }
+  return user;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
+}
+
+function trimTimedCache(map, maxSize) {
+  if (map.size <= maxSize) return;
+  const now = Date.now();
+  for (const [key, value] of map) {
+    if (value?.expires && value.expires <= now) map.delete(key);
+  }
+  while (map.size > maxSize) map.delete(map.keys().next().value);
 }
 
 function detectSeasonId(games, seasonKey, mode) {
@@ -305,7 +392,7 @@ function consumeRate(req) {
   const ip = raw.split(',')[0].trim();
   const now = Date.now();
   const windowMs = 60_000;
-  const maxRequests = 36;
+  const maxRequests = 30;
   let bucket = rateBuckets.get(ip);
   if (!bucket || bucket.resetAt <= now) bucket = { count: 0, resetAt: now + windowMs };
   bucket.count += 1;

@@ -1,0 +1,8 @@
+{
+  "name": "er-openapi-temporary-proxy",
+  "version": "3.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  }
+}

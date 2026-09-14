@@ -1,0 +1,20 @@
+{
+  "functions": {
+    "api/er.js": {
+      "maxDuration": 10
+    },
+    "api/status.js": {
+      "maxDuration": 10
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "/api/status"
+    },
+    {
+      "source": "/er/:path*",
+      "destination": "/api/er?path=:path*"
+    }
+  ]
+}

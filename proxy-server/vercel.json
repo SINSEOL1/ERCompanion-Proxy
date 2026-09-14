@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/resolve-characters.js": {
-      "maxDuration": 10
-    }
-  }
-}

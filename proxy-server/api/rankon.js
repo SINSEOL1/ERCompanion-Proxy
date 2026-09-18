@@ -101,7 +101,13 @@ function seasonDateToIso(value) {
 async function getCurrentSeason() {
   return cached('season:current', 10 * 60_000, async () => {
     const payload = await official('/v2/data/Season');
-    const rows = Array.isArray(payload?.data) ? payload.data : [];
+    const rows = Array.isArray(payload?.data)
+      ? payload.data
+      : Array.isArray(payload?.Season)
+        ? payload.Season
+        : Array.isArray(payload)
+          ? payload
+          : [];
     const now = Date.now();
 
     let current = rows.find(row => Number(row?.isCurrent) === 1 || row?.isCurrent === true);
@@ -138,7 +144,13 @@ async function getCurrentSeason() {
 async function getCuts(seasonId) {
   return cached(`cuts:${seasonId}`, 45_000, async () => {
     const payload = await official(`/v1/rank/top/${seasonId}/3`);
-    const ranks = Array.isArray(payload?.topRanks) ? payload.topRanks : [];
+    const ranks = Array.isArray(payload?.topRanks)
+      ? payload.topRanks
+      : Array.isArray(payload?.data?.topRanks)
+        ? payload.data.topRanks
+        : Array.isArray(payload?.data)
+          ? payload.data
+          : [];
 
     const normalized = ranks
       .map(item => ({
@@ -211,17 +223,20 @@ async function resolveNickname(nickname) {
 
   return cached(`resolve:${key}`, 15 * 60_000, async () => {
     const payload = await official(`/v1/user/nickname?query=${encodeURIComponent(nickname)}`);
-    const user = payload?.user;
+    const user = payload?.user ?? payload?.data?.user ?? payload?.data ?? null;
+    const uid = user?.uid ?? user?.userId ?? user?.id ?? null;
 
-    if (!user?.uid) {
-      const error = new Error('Player not found.');
-      error.statusCode = 404;
+    if (!uid) {
+      const error = new Error(
+        `Player lookup returned no UID. code=${payload?.code ?? 'unknown'} message=${payload?.message ?? 'unknown'}`
+      );
+      error.statusCode = Number(payload?.code) === 404 ? 404 : 502;
       throw error;
     }
 
     return {
-      uid: String(user.uid),
-      nickname: String(user.nickname || nickname),
+      uid: String(uid),
+      nickname: String(user?.nickname || nickname),
     };
   });
 }
@@ -236,7 +251,7 @@ async function getRankState(uid) {
     getCuts(season.seasonId),
   ]);
 
-  const rankData = rankPayload?.userRank;
+  const rankData = rankPayload?.userRank ?? rankPayload?.data?.userRank ?? rankPayload?.data ?? null;
 
   if (!rankData) {
     const error = new Error('Rank data not found for the current season.');

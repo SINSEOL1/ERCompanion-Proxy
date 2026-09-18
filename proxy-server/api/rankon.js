@@ -218,6 +218,51 @@ function getTier(rp, rank) {
   return { key: tier[1], nameKo: tier[2], division: tier[3] };
 }
 
+function getNextTierTarget(tier, rp, cuts) {
+  const regularTargets = {
+    iron: { tierKey: 'bronze', tierNameKo: '브론즈', rp: 600 },
+    bronze: { tierKey: 'silver', tierNameKo: '실버', rp: 1400 },
+    silver: { tierKey: 'gold', tierNameKo: '골드', rp: 2400 },
+    gold: { tierKey: 'platinum', tierNameKo: '플래티넘', rp: 3600 },
+    platinum: { tierKey: 'diamond', tierNameKo: '다이아몬드', rp: 5000 },
+    diamond: { tierKey: 'meteorite', tierNameKo: '메테오라이트', rp: 6400 },
+    meteorite: { tierKey: 'mythril', tierNameKo: '미스릴', rp: 7600 },
+  };
+
+  if (tier.key === 'mythril' && cuts.demigodRp != null) {
+    return {
+      tierKey: 'demigod',
+      tierNameKo: '데미갓',
+      rp: cuts.demigodRp,
+      remainingRp: Math.max(0, cuts.demigodRp - rp),
+    };
+  }
+
+  if (tier.key === 'demigod' && cuts.eternityRp != null) {
+    return {
+      tierKey: 'eternity',
+      tierNameKo: '이터니티',
+      rp: cuts.eternityRp,
+      remainingRp: Math.max(0, cuts.eternityRp - rp),
+    };
+  }
+
+  if (tier.key === 'eternity') {
+    return null;
+  }
+
+  const target = regularTargets[tier.key];
+
+  if (!target) {
+    return null;
+  }
+
+  return {
+    ...target,
+    remainingRp: Math.max(0, target.rp - rp),
+  };
+}
+
 async function resolveNickname(nickname) {
   const key = nickname.toLocaleLowerCase('en-US');
 
@@ -262,6 +307,7 @@ async function getRankState(uid) {
   const rp = Number(rankData.mmr || 0);
   const rank = Number(rankData.rank || 0);
   const tier = getTier(rp, rank);
+  const nextTier = getNextTierTarget(tier, rp, cuts);
 
   let nextCut = null;
 
@@ -291,6 +337,7 @@ async function getRankState(uid) {
     serverRank: Number(rankData.serverRank || 0),
     tier,
     cuts,
+    nextTier,
     nextCut,
   };
 }

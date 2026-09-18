@@ -5,6 +5,9 @@
     },
     "api/status.js": {
       "maxDuration": 10
+    },
+    "api/rankon.js": {
+      "maxDuration": 10
     }
   },
   "rewrites": [
@@ -15,6 +18,10 @@
     {
       "source": "/er/:path*",
       "destination": "/api/er?path=:path*"
+    },
+    {
+      "source": "/rankon/:action",
+      "destination": "/api/rankon?action=:action"
     }
   ]
 }

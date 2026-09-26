@@ -342,6 +342,46 @@ async function getRankState(uid) {
   };
 }
 
+async function getRecentMatches(uid) {
+  const season = await getCurrentSeason();
+
+  return cached(`matches:${uid}:${season.seasonId}`, 20_000, async () => {
+    const payload = await official(`/v1/user/games/uid/${encodeURIComponent(uid)}`);
+    const games = Array.isArray(payload?.userGames)
+      ? payload.userGames
+      : Array.isArray(payload?.data?.userGames)
+        ? payload.data.userGames
+        : Array.isArray(payload?.data)
+          ? payload.data
+          : [];
+
+    const matches = games
+      .map(item => ({
+        gameId: Number(item?.gameId || 0),
+        rank: Number(item?.gameRank || 0),
+        matchingMode: Number(item?.matchingMode || 0),
+        matchingTeamMode: Number(item?.matchingTeamMode || 0),
+        seasonId: Number(item?.seasonId || 0),
+      }))
+      .filter(item =>
+        item.gameId > 0 &&
+        item.rank >= 1 &&
+        item.rank <= 8 &&
+        item.matchingMode === 3 &&
+        item.matchingTeamMode === 3 &&
+        item.seasonId === season.seasonId
+      )
+      .sort((a, b) => b.gameId - a.gameId)
+      .slice(0, 30)
+      .map(({ gameId, rank }) => ({ gameId, rank }));
+
+    return {
+      seasonId: season.seasonId,
+      matches,
+    };
+  });
+}
+
 module.exports = async function handler(req, res) {
   setCors(res);
 
@@ -395,6 +435,17 @@ module.exports = async function handler(req, res) {
       return res.status(200).json(await getRankState(uid));
     }
 
+
+    if (action === 'matches') {
+      const uid = String(req.query?.uid || '').trim();
+
+      if (!uid || uid.length > 128) {
+        return res.status(400).json({ error: 'invalid_uid' });
+      }
+
+      return res.status(200).json(await getRecentMatches(uid));
+    }
+
     if (action === 'profile') {
       const nickname = String(req.query?.nickname || '').trim();
 
@@ -408,7 +459,7 @@ module.exports = async function handler(req, res) {
 
     return res.status(400).json({
       error: 'invalid_action',
-      actions: ['resolve', 'rank', 'profile', 'cuts', 'season'],
+      actions: ['resolve', 'rank', 'matches', 'profile', 'cuts', 'season'],
     });
   } catch (error) {
     const status = Number(error?.statusCode) || 502;
